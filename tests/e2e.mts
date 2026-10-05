@@ -106,9 +106,11 @@ interface FakeCall { kind: 'create' | 'resume' | 'followup' | 'dispose' | 'cance
  * both streams, and enforces the deadline and the abort signal. Records every
  * request so a test can assert what the runner asked for.
  * @param timeoutCapMs - an executor-side cap, as a real executor's `maxTimeoutMs` is.
+ * @param handle - the seam generation to present: dsh 0.1.7-rc.2+ resolves to a
+ *   handle whose `result` is a method, dsh 0.1.5-rc.2 carried it as a promise property.
  * @returns the executor plus the recorded requests.
  */
-function makeFakeShell(timeoutCapMs?: number): { executor: HostShellExecutor; specs: HostShellRequest[] } {
+function makeFakeShell(timeoutCapMs?: number, handle: 'method' | 'property' = 'method'): { executor: HostShellExecutor; specs: HostShellRequest[] } {
   const specs: HostShellRequest[] = []
   const executor = {
     resolve: (request: HostShellRequest): unknown => {
@@ -119,7 +121,7 @@ function makeFakeShell(timeoutCapMs?: number): { executor: HostShellExecutor; sp
         : Math.min(requested === 0 ? timeoutCapMs : requested, timeoutCapMs)
       return { ...request, workdir: request.workdir ?? process.cwd(), timeoutMs: applied }
     },
-    execute: async (spec: unknown): Promise<{ result: Promise<HostShellResult>; kill(): void }> => {
+    execute: async (spec: unknown): Promise<{ result: unknown }> => {
       const parsed = spec as { command: string; workdir: string; timeoutMs: number; signal?: AbortSignal }
       const shell = process.platform === 'win32' ? 'cmd.exe' : '/bin/sh'
       const flag = process.platform === 'win32' ? '/c' : '-c'
@@ -182,19 +184,19 @@ function makeFakeShell(timeoutCapMs?: number): { executor: HostShellExecutor; sp
           })
         })
       })
-      return { result, kill }
+      return { result: handle === 'method' ? () => result : result }
     },
   }
   return { executor: executor as unknown as HostShellExecutor, specs }
 }
 
-function makeFakeHost(options: { fsMap?: Record<string, string>, timeoutCapMs?: number } = {}): {
+function makeFakeHost(options: { fsMap?: Record<string, string>, timeoutCapMs?: number, shellHandle?: 'method' | 'property' } = {}): {
   ctx: HostPluginContext
   calls: FakeCall[]
   shellSpecs: HostShellRequest[]
   emit: (sessionId: string, type: string, data: unknown) => void
 } {
-  const shell = makeFakeShell(options.timeoutCapMs)
+  const shell = makeFakeShell(options.timeoutCapMs, options.shellHandle ?? 'method')
   const fsMap = options.fsMap ?? {}
   const calls: FakeCall[] = []
   const inflight = new Map<string, HostAgent>() // by sessionId
@@ -833,6 +835,39 @@ section('TimerRunner: command job runs through the shell seam, not a raw spawn')
     done?.executions[0]?.result === 'succeeded' && (done?.executions[0]?.output ?? '').includes('2'),
     `${done?.executions[0]?.result}/${done?.executions[0]?.output}`)
   check('seamed run created no agent session', !host.calls.some(c => c.kind === 'create' || c.kind === 'resume'))
+}
+
+section('TimerRunner: a command job settles through either shell-handle generation')
+{
+  // dsh 0.1.7-rc.2 converged the shell seam on `execute()` and made the handle's
+  // `result` a method; 0.1.5-rc.2 exposed the same promise as a property. A
+  // command job must settle on both — reading `.then` off the method form was a
+  // fatal load failure ('handle.result.then is not a function').
+  const runOnce = async (handle: 'method' | 'property'): Promise<string | undefined> => {
+    const host = makeFakeHost({ shellHandle: handle })
+    const store = new HostJobStore(join(tempDir, `handle-${handle}.json`))
+    const now = Date.UTC(2026, 0, 1)
+    const runner = new TimerRunner({ ctx: host.ctx, store, now: () => now })
+    const job = createJob({
+      title: `handle-${handle}`, description: '', prompt: '',
+      kind: 'command', command: 'node', args: '-e "console.log(\'ok\')"',
+      target: { workdir: '', sessionId: '' },
+    }, now, `job-${handle}`)
+    await store.mutate(jobs => ({ jobs: [job], result: true }))
+    check(`[${handle}] manual run accepted`, await runner.requestRun(`job-${handle}`) === true)
+    for (let i = 0; i < 40 && ((await store.load())[0]?.executions[0]?.endedAt === undefined); i++) {
+      await new Promise(r => setTimeout(r, 50))
+    }
+    const execution = (await store.load())[0]?.executions[0]
+    return `${execution?.result}/${execution?.output ?? ''}`
+  }
+
+  const method = await runOnce('method')
+  check('a method-form handle settles succeeded with its output',
+    method?.startsWith('succeeded') === true && method.includes('ok'), method)
+  const property = await runOnce('property')
+  check('a promise-property handle settles succeeded with its output',
+    property?.startsWith('succeeded') === true && property.includes('ok'), property)
 }
 
 section('TimerRunner: a workdir the execution world cannot reach fails the run')

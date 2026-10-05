@@ -261,12 +261,27 @@ export interface HostShellResult {
   readonly stderr: HostShellStream
 }
 
-/** A prepared execution handle (subset of `ShellExecution`). */
+/**
+ * A prepared execution handle (subset of `ShellExecution`).
+ *
+ * `result` is where the two seam generations differ: dsh 0.1.7-rc.2 converged
+ * the shell seam on `execute()` and made it the method
+ * `result(): Promise<ShellRunResult>`, while 0.1.5-rc.2's handle carried the
+ * promise as the `result` property. {@link settleShellExecution} accepts either.
+ */
 export interface HostShellExecution {
   /** Settles at process close; rejects only for infrastructure failures. */
-  readonly result: Promise<HostShellResult>
-  /** Best-effort cancellation of the running process. */
-  kill(): void
+  readonly result: (() => Promise<HostShellResult>) | Promise<HostShellResult>
+}
+
+/**
+ * The foreground result of one execution handle, whichever seam generation
+ * produced it.
+ * @param handle - the handle `ctx.shell.execute` resolved to.
+ * @returns the settled result for that execution.
+ */
+export function settleShellExecution(handle: HostShellExecution): Promise<HostShellResult> {
+  return typeof handle.result === 'function' ? handle.result() : handle.result
 }
 
 /**

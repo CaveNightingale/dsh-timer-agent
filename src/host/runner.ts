@@ -20,7 +20,7 @@ import type {
   HostAgent, HostAgentHandle, HostAgentRegistry, HostFs, HostPluginContext,
   HostSession, HostSessionEvent, HostShellExecutor, HostShellResult, HostUserMessage, HostWorkspaceRegistry,
 } from './contracts.ts'
-import { isTurnEndEvent, turnErrorDetail } from './contracts.ts'
+import { isTurnEndEvent, settleShellExecution, turnErrorDetail } from './contracts.ts'
 import type { HostJobStore } from './store.ts'
 import { isIntervalRule, isOneShotRule, isSchedulable, nextRunAtMs, scheduleNextMs } from '../core/schedule.ts'
 import { appendCapped, joinCommandArgs, splitCommandArgs, truncateOutputTail, OUTPUT_TAIL_BYTES } from '../core/command.ts'
@@ -409,26 +409,33 @@ export class TimerRunner {
         stdoutMaxBytes: OUTPUT_TAIL_BYTES,
         signal: controller.signal,
       })
-      void shell.execute(spec).then(
-        handle => handle.result.then(
-          result => {
-            this.commandFlights.delete(execution.id)
-            this.settleCommand(job, execution, command, result)
-          },
-          (error: unknown) => {
-            this.commandFlights.delete(execution.id)
-            void this.settle(job.id, execution.id, 'failed', `failed to start command '${command}': ${error instanceof Error ? error.message : String(error)}`)
-          },
-        ),
-        (error: unknown) => {
-          this.commandFlights.delete(execution.id)
-          void this.settle(job.id, execution.id, 'failed', `failed to start command '${command}': ${error instanceof Error ? error.message : String(error)}`)
-        },
-      )
+      void this.settleCommandFlight(job, execution, command, spec, shell)
     } catch (error) {
-      this.commandFlights.delete(execution.id)
-      void this.settle(job.id, execution.id, 'failed', `failed to start command '${command}': ${error instanceof Error ? error.message : String(error)}`)
+      this.failCommandStart(job, execution, command, error)
     }
+  }
+
+  /** Await one started flight, then settle the job from the executor's result. */
+  private async settleCommandFlight(
+    job: JobRecord,
+    execution: ExecutionRecord,
+    command: string,
+    spec: unknown,
+    shell: HostShellExecutor,
+  ): Promise<void> {
+    try {
+      const result = await settleShellExecution(await shell.execute(spec))
+      this.commandFlights.delete(execution.id)
+      this.settleCommand(job, execution, command, result)
+    } catch (error) {
+      this.failCommandStart(job, execution, command, error)
+    }
+  }
+
+  /** Settle a command flight the executor never started. */
+  private failCommandStart(job: JobRecord, execution: ExecutionRecord, command: string, error: unknown): void {
+    this.commandFlights.delete(execution.id)
+    void this.settle(job.id, execution.id, 'failed', `failed to start command '${command}': ${error instanceof Error ? error.message : String(error)}`)
   }
 
   /** Settle one finished command run from the executor's own result facts. */
