@@ -225,6 +225,79 @@ export interface HostWorkspaceRegistry {
   list?(): readonly HostWorkspace[]
 }
 
+/** One execution request for the `shell` service (subset of `ShellExecRequest`). */
+export interface HostShellRequest {
+  /** The command line to run. */
+  readonly command: string
+  /** Working directory in the executor's execution world; defaulted by the executor. */
+  readonly workdir?: string
+  /** Deadline in milliseconds; the executor caps and enforces it. */
+  readonly timeoutMs?: number
+  /** Foreground stdout capture budget in bytes. */
+  readonly stdoutMaxBytes?: number
+  /** Cancellation; the executor kills the command when it fires. */
+  readonly signal?: AbortSignal
+}
+
+/** One captured stream (subset of `CollectedOutput`): the TAIL when truncated. */
+export interface HostShellStream {
+  readonly text: string
+  readonly truncated: boolean
+}
+
+/** A finished run (subset of `ShellRunResult`). */
+export interface HostShellResult {
+  /** Exit code, or null when preparation expired or a signal killed the process. */
+  readonly exitCode: number | null
+  /** Terminating signal, or null when none was reported. */
+  readonly signal: string | null
+  /** True when the executor's own deadline was the first cause to cut the run short. */
+  readonly timedOut: boolean
+  /** True when the caller's `AbortSignal` was the first cause to kill the run. */
+  readonly aborted: boolean
+  /** The effective timeout applied to this run (after the executor's defaulting and capping). */
+  readonly timeoutMs: number
+  readonly stdout: HostShellStream
+  readonly stderr: HostShellStream
+}
+
+/** A prepared execution handle (subset of `ShellExecution`). */
+export interface HostShellExecution {
+  /** Settles at process close; rejects only for infrastructure failures. */
+  readonly result: Promise<HostShellResult>
+  /** Best-effort cancellation of the running process. */
+  kill(): void
+}
+
+/**
+ * The `shell` service (subset of the host `ShellExecutor`).
+ *
+ * Command jobs run through this seam rather than `node:child_process`, so the
+ * deployment decides what a command is: a sandboxing executor (the stock
+ * `bash-sandbox`, or dsh-bwrap-sandbox's replacement) confines it and resolves
+ * its `workdir` in that execution world, while a plain local executor spawns
+ * it directly.
+ */
+export interface HostShellExecutor {
+  /** Apply the executor's defaults and caps to a request. */
+  resolve(request: HostShellRequest): unknown
+  /** Prepare and start one execution. */
+  execute(spec: unknown): Promise<HostShellExecution>
+}
+
+/**
+ * The `fs` service (subset): the execution world's spelling of a path.
+ *
+ * A job's workdir comes from the GUI's project tree, which names host
+ * directories, while a session header cwd and a shell `workdir` are spelled the
+ * way the execution world spells them. A local deployment maps a path onto
+ * itself; a sandboxed one maps the bound project onto its virtual name.
+ */
+export interface HostFs {
+  /** The execution-world path for a harness-host path, or undefined when it is unreachable there. */
+  processPathFromHostPath(hostPath: string): string | undefined
+}
+
 /** One immutable entry in the host session log. */
 export interface HostSessionEvent {
   readonly type: string

@@ -19,10 +19,12 @@ Manage jobs right from any conversation with the `timer_agent` tool (create / li
 ## Two job kinds
 
 - **AI Agent job** (default): each fire drives a real agent session executing your prompt; consumes API quota
-- **Command job**: each fire spawns `command + args` you specify (optional workdir and timeout) — **no AI, no quota**; exit code plus the tail (≤16k chars) of stdout/stderr lands on the execution record. Great for self-contained scripts (downloads, exports, credential renewal)
+- **Command job**: each fire runs `command + args` through the harness **shell seam (`ctx.shell`)** you specify (optional workdir and timeout) — **no AI, no quota**; exit code plus the tail (≤16k chars) of stdout/stderr lands on the execution record. Great for self-contained scripts (downloads, exports, credential renewal)
+
+  > The seam is why a run follows its deployment: with a sandboxing executor (`dsh-bwrap-sandbox`'s `bash-bwrap`, or the shipped `bash-sandbox`) the command is confined and its `workdir` resolves in that execution world; with a local executor it is an ordinary process. With no `ctx.shell` mounted the run settles failed instead of falling back to an unconfined spawn.
 
 > [!WARNING]
-> **Command jobs execute arbitrary commands on your machine with your current user privileges — no sandbox, no allowlist.** Anyone who can create/edit jobs (you, any agent session able to call the `timer_agent` tool, any local process that can reach the loopback API) can schedule arbitrary programs. Only schedule commands you have reviewed and that are safe to run unattended; do not expose this plugin to untrusted environments; a tampered `jobs.json` ledger is equivalent to arbitrary local code execution. **Use with care.**
+> **Command jobs run arbitrary commands with your current user privileges, confined only as far as the deployment's executor confines them.** Under a sandboxing deployment they run inside that sandbox (the same rules as the `bash` tool); under a plain one they are unconfined local processes with no allowlist. Anyone who can create/edit jobs (you, any agent session able to call the `timer_agent` tool, any local process that can reach the loopback API) can schedule arbitrary programs. Only schedule commands you have reviewed and that are safe to run unattended; do not expose this plugin to untrusted environments; a tampered `jobs.json` ledger is equivalent to arbitrary local code execution. **Use with care.**
 
 ## Architecture (isomorphic to hermes-agent cron)
 
@@ -140,7 +142,7 @@ The E2E suite covers: cron parsing and next-run computation (local-time semantic
 **Permissions** (the four signals visible to static source scanning — all required by plugin features):
 
 - **Files**: atomic read/write of the jobs ledger `~/.dsh/timer-agent/jobs.json` (store); never touches dsh core directories or other profiles
-- **Commands**: `command`-kind jobs spawn the command the job author configured (optional workdir cwd, inherits host `process.env`); `prompt`-kind jobs execute through the dsh session API and never open a shell
+- **Commands**: `command`-kind jobs run the configured command through `ctx.shell` (optional workdir cwd, resolved in the execution world; the child inherits host `process.env`); `prompt`-kind jobs execute through the dsh session API and never open a shell
 - **Network**: localhost only — the web GUI calls same-origin `/api/dsh-timer-agent/*` routes and the host talks to the local dsh service via the dsh client; no external services
 - **Credentials**: spawned children inherit host `process.env` (dsh credentials reach the CLI via env vars); the plugin itself never reads, logs, or persists credentials or secrets
 

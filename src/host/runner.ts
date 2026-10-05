@@ -16,15 +16,14 @@
  *   execution success/failed).
  */
 import { randomUUID } from 'node:crypto'
-import { spawn } from 'node:child_process'
 import type {
-  HostAgent, HostAgentHandle, HostAgentRegistry, HostPluginContext,
-  HostSession, HostSessionEvent, HostUserMessage, HostWorkspaceRegistry,
+  HostAgent, HostAgentHandle, HostAgentRegistry, HostFs, HostPluginContext,
+  HostSession, HostSessionEvent, HostShellExecutor, HostShellResult, HostUserMessage, HostWorkspaceRegistry,
 } from './contracts.ts'
 import { isTurnEndEvent, turnErrorDetail } from './contracts.ts'
 import type { HostJobStore } from './store.ts'
 import { isIntervalRule, isOneShotRule, isSchedulable, nextRunAtMs, scheduleNextMs } from '../core/schedule.ts'
-import { appendCapped, splitCommandArgs, truncateOutputTail } from '../core/command.ts'
+import { appendCapped, joinCommandArgs, splitCommandArgs, truncateOutputTail, OUTPUT_TAIL_BYTES } from '../core/command.ts'
 import {
   settleExecution, startExecution, withSchedule, jobKind,
   type ExecutionRecord, type JobRecord,
@@ -319,7 +318,7 @@ export class TimerRunner {
     return true
   }
 
-  /** The real execution: command jobs spawn directly; agent jobs connect/create the agent and send the prompt. */
+  /** The real execution: command jobs run through `ctx.shell`; agent jobs connect/create the agent and send the prompt. */
   private async execute(job: JobRecord, execution: ExecutionRecord): Promise<void> {
     if (jobKind(job) === 'command') {
       this.executeCommand(job, execution)
@@ -354,15 +353,28 @@ export class TimerRunner {
   }
 
   /**
-   * Command execution (普通任务): spawn the job's command + args directly —
-   * no AI, no session, no API quota. Exit 0 settles succeeded; anything else
-   * (nonzero exit, spawn failure, timeout kill) settles failed with the
-   * captured stdout/stderr tail attached to the execution record.
+   * Command execution (普通任务): run the job's command + args through the
+   * harness shell seam (`ctx.shell`) — no AI, no session, no API quota.
+   *
+   * The seam is what makes a run follow its deployment: a sandboxing executor
+   * (the stock `bash-sandbox`, or dsh-bwrap-sandbox's replacement for it)
+   * confines the process and resolves `workdir` in that execution world, while
+   * a local executor spawns it directly. A `node:child_process` spawn here
+   * would bypass both, so an absent shell service fails the execution instead
+   * of running the command unconfined.
+   *
+   * Exit 0 settles succeeded; anything else (nonzero exit, deadline kill,
+   * runner failure) settles failed with the captured stdout/stderr tail.
    */
   private executeCommand(job: JobRecord, execution: ExecutionRecord): void {
     const command = (job.command ?? '').trim()
     if (command === '') {
       void this.settle(job.id, execution.id, 'failed', 'command is empty (edit the job and set a command)')
+      return
+    }
+    const shell = this.ctx.get('shell') as HostShellExecutor | undefined
+    if (shell === undefined) {
+      void this.settle(job.id, execution.id, 'failed', 'shell service unavailable (no ctx.shell mounted); the command was not executed')
       return
     }
     let argv: string[]
@@ -372,52 +384,107 @@ export class TimerRunner {
       void this.settle(job.id, execution.id, 'failed', error instanceof Error ? error.message : String(error))
       return
     }
-    let stdout = ''
-    let stderr = ''
-    let child: { kill(): void } | undefined
-    try {
-      const spawned = spawn(argv[0], argv.slice(1), {
-        cwd: job.target.workdir.trim() !== '' ? job.target.workdir.trim() : undefined,
-        env: process.env,
-        windowsHide: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
-      child = spawned
-      spawned.stdout?.on('data', (chunk: Uint8Array) => { stdout = appendCapped(stdout, Buffer.from(chunk).toString('utf8')) })
-      spawned.stderr?.on('data', (chunk: Uint8Array) => { stderr = appendCapped(stderr, Buffer.from(chunk).toString('utf8')) })
-      const timeoutMs = job.timeoutMs !== undefined && job.timeoutMs > 0 ? job.timeoutMs : undefined
-      this.commandFlights.set(execution.id, {
-        jobId: job.id,
-        timeoutMs,
-        timeoutAt: timeoutMs !== undefined ? this.now() + timeoutMs : undefined,
-        kill: () => { try { spawned.kill() } catch { /* best effort */ } },
-      })
-      spawned.on('error', error => {
-        this.commandFlights.delete(execution.id)
-        void this.settle(job.id, execution.id, 'failed',
-          `failed to start command '${command}': ${error instanceof Error ? error.message : String(error)}`)
-      })
-      spawned.on('close', (code, signal) => {
-        this.commandFlights.delete(execution.id)
-        const output = truncateOutputTail(stdout === '' && stderr === '' ? '' : `${stdout}${stderr === '' ? '' : `\n[stderr]\n${stderr}`}`)
-        // A kill from the timeout path already settled this execution
-        // (settle is idempotent); a spontaneous close settles here.
-        if (signal !== null && signal !== undefined) {
-          void this.settle(job.id, execution.id, 'failed', `command killed by signal ${signal}`, { output })
-          return
-        }
-        if (code === 0) {
-          void this.settle(job.id, execution.id, 'succeeded', undefined, { exitCode: 0, output })
-          return
-        }
-        void this.settle(job.id, execution.id, 'failed',
-          code === null ? 'command exited without an exit code' : `command exited with code ${code}`,
-          { exitCode: code ?? undefined, output })
-      })
-    } catch (error) {
-      if (child !== undefined) this.commandFlights.delete(execution.id)
-      void this.settle(job.id, execution.id, 'failed', error instanceof Error ? error.message : String(error))
+    const workdir = job.target.workdir.trim()
+    const worldWorkdir = workdir === '' ? undefined : this.worldPath(workdir)
+    if (workdir !== '' && worldWorkdir === undefined) {
+      void this.settle(job.id, execution.id, 'failed', this.unreachableWorkdir(workdir).message)
+      return
     }
+    const timeoutMs = job.timeoutMs !== undefined && job.timeoutMs > 0 ? job.timeoutMs : undefined
+    // The controller is the flight's kill switch: the executor treats an
+    // already-aborted signal as fired, so registering it before preparation
+    // keeps dispose() able to stop a command that has not started yet.
+    const controller = new AbortController()
+    this.commandFlights.set(execution.id, {
+      jobId: job.id,
+      timeoutMs,
+      timeoutAt: timeoutMs !== undefined ? this.now() + timeoutMs : undefined,
+      kill: () => controller.abort(),
+    })
+    try {
+      const spec = shell.resolve({
+        command: joinCommandArgs(argv),
+        ...(worldWorkdir !== undefined ? { workdir: worldWorkdir } : {}),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        stdoutMaxBytes: OUTPUT_TAIL_BYTES,
+        signal: controller.signal,
+      })
+      void shell.execute(spec).then(
+        handle => handle.result.then(
+          result => {
+            this.commandFlights.delete(execution.id)
+            this.settleCommand(job, execution, command, result)
+          },
+          (error: unknown) => {
+            this.commandFlights.delete(execution.id)
+            void this.settle(job.id, execution.id, 'failed', `failed to start command '${command}': ${error instanceof Error ? error.message : String(error)}`)
+          },
+        ),
+        (error: unknown) => {
+          this.commandFlights.delete(execution.id)
+          void this.settle(job.id, execution.id, 'failed', `failed to start command '${command}': ${error instanceof Error ? error.message : String(error)}`)
+        },
+      )
+    } catch (error) {
+      this.commandFlights.delete(execution.id)
+      void this.settle(job.id, execution.id, 'failed', `failed to start command '${command}': ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  /** Settle one finished command run from the executor's own result facts. */
+  private settleCommand(job: JobRecord, execution: ExecutionRecord, command: string, result: HostShellResult): void {
+    const streams = result.stdout.text === '' && result.stderr.text === ''
+      ? ''
+      : `${result.stdout.text}${result.stderr.text === '' ? '' : `\n[stderr]\n${result.stderr.text}`}`
+    const output = truncateOutputTail(streams)
+    if (result.timedOut) {
+      // The applied deadline, not the job's request: the executor defaults and
+      // caps it, so a job that configured none can still be cut short by the
+      // deployment's own limit.
+      const applied = result.timeoutMs
+      const reason = applied > 0
+        ? `command timed out after ${Math.max(1, Math.round(applied / 1000))}s (killed)`
+        : 'command timed out (killed)'
+      void this.settle(job.id, execution.id, 'failed', reason, { output })
+      return
+    }
+    if (result.aborted) {
+      void this.settle(job.id, execution.id, 'failed', `command cancelled before it finished`, { output })
+      return
+    }
+    if (result.signal !== null) {
+      void this.settle(job.id, execution.id, 'failed', `command killed by signal ${result.signal}`, { output })
+      return
+    }
+    if (result.exitCode === 0) {
+      void this.settle(job.id, execution.id, 'succeeded', undefined, { exitCode: 0, output })
+      return
+    }
+    void this.settle(job.id, execution.id, 'failed',
+      result.exitCode === null ? 'command exited without an exit code' : `command exited with code ${result.exitCode}`,
+      { exitCode: result.exitCode ?? undefined, output })
+  }
+
+  /**
+   * The execution-world spelling of a host path, or `undefined` when that path
+   * is unreachable there.
+   *
+   * A job's workdir comes from the GUI's project tree, which names host
+   * directories; a session header cwd and a shell `workdir` are spelled the way
+   * the execution world spells them (a sandboxed deployment binds the project at
+   * `/workspace`). A local deployment maps a path onto itself. With no fs
+   * service mounted there is no mapping layer and the host spelling is all there
+   * is; with one, `undefined` means the deployment's execution world cannot
+   * reach that directory, which is reported rather than papered over.
+   */
+  private worldPath(hostPath: string): string | undefined {
+    const fs = this.ctx.get('fs') as HostFs | undefined
+    return fs === undefined ? hostPath : fs.processPathFromHostPath(hostPath)
+  }
+
+  /** The message a workdir no execution world can reach gets. */
+  private unreachableWorkdir(hostPath: string): Error {
+    return new Error(`workdir "${hostPath}" is not reachable in this deployment's execution world`)
   }
 
   /**
@@ -489,11 +556,16 @@ export class TimerRunner {
     let presetMeta: { agentPreset: string } | undefined
     let presetSetup: ((agentCtx: object) => Promise<void>) | undefined
     ;({ presetMeta, presetSetup } = await this.composePreset(job.preset))
+    let cwd: string | undefined
+    if (job.target.workdir !== '') {
+      cwd = this.worldPath(job.target.workdir)
+      if (cwd === undefined) throw this.unreachableWorkdir(job.target.workdir)
+    }
     const handle = await agents.create({
       sessionId,
       ...(agentOptions !== undefined ? { agentOptions } : {}),
-      ...(job.target.workdir !== ''
-        ? { meta: { cwd: job.target.workdir, ...presetMeta } }
+      ...(cwd !== undefined
+        ? { meta: { cwd, ...presetMeta } }
         : presetMeta === undefined ? {} : { meta: presetMeta }),
       ...(presetSetup === undefined ? {} : { setup: presetSetup }),
     })
@@ -578,7 +650,15 @@ export class TimerRunner {
     const registry = this.ctx.get('workspaceRegistry') as HostWorkspaceRegistry | undefined
     if (registry === undefined) return
     const workspace = await registry.resolveByPath(workdir) ?? await registry.create(workdir).catch(() => undefined)
-    await workspace?.attachSession(sessionId)
+    try {
+      await workspace?.attachSession(sessionId)
+    } catch (error) {
+      // A deployment whose filesystem spells the project differently (a sandbox
+      // binding it at /workspace) records that spelling in the session header,
+      // while workspace records are keyed by the host path, so the registry's
+      // cwd check rejects the attach. The run is unaffected; grouping is not.
+      console.warn('[dsh-timer-agent] session/workspace attach failed:', error)
+    }
   }
 
   /** Fold the session-event stream into execution settlement. */

@@ -17,17 +17,19 @@
  *   hand-pinned nextRunAt, pause-keeps/resume-reanchors, and nextRunAt /
  *   runAt pinning across routes and the tool
  */
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { spawn } from 'node:child_process'
 import { isValidCron, nextRunAtMs } from '../src/core/schedule.ts'
-import { splitCommandArgs, truncateOutputTail } from '../src/core/command.ts'
+import { appendCapped, splitCommandArgs, truncateOutputTail, OUTPUT_TAIL_BYTES } from '../src/core/command.ts'
 import { HostJobStore } from '../src/host/store.ts'
 import { TimerRunner } from '../src/host/runner.ts'
 import { registerTimerTool } from '../src/host/tools.ts'
 import { makeRoutes } from '../src/host/routes.ts'
 import type {
   HostAgent, HostAgentHandle, HostPluginContext, HostRoute,
+  HostShellExecutor, HostShellRequest, HostShellResult,
   NodeIncomingMessage, NodeServerResponse,
 } from '../src/host/contracts.ts'
 import { commandLine, createJob, jobKind, normalizeTimeoutMs, timeoutLabel, withSchedule, type JobRecord } from '../src/core/jobs.ts'
@@ -97,7 +99,102 @@ section('TimerRunner: due firing + at-most-once')
 
 interface FakeCall { kind: 'create' | 'resume' | 'followup' | 'dispose' | 'cancel'; sessionId?: string; prompt?: string; cwd?: string }
 
-function makeFakeHost(): { ctx: HostPluginContext; calls: FakeCall[]; emit: (sessionId: string, type: string, data: unknown) => void } {
+/**
+ * A shell executor shaped like the harness seam: it runs the command through the
+ * platform shell (so quoting behaves the way a real executor's does), captures
+ * both streams, and enforces the deadline and the abort signal. Records every
+ * request so a test can assert what the runner asked for.
+ * @param timeoutCapMs - an executor-side cap, as a real executor's `maxTimeoutMs` is.
+ * @returns the executor plus the recorded requests.
+ */
+function makeFakeShell(timeoutCapMs?: number): { executor: HostShellExecutor; specs: HostShellRequest[] } {
+  const specs: HostShellRequest[] = []
+  const executor = {
+    resolve: (request: HostShellRequest): unknown => {
+      specs.push(request)
+      const requested = request.timeoutMs ?? 0
+      const applied = timeoutCapMs === undefined
+        ? requested
+        : Math.min(requested === 0 ? timeoutCapMs : requested, timeoutCapMs)
+      return { ...request, workdir: request.workdir ?? process.cwd(), timeoutMs: applied }
+    },
+    execute: async (spec: unknown): Promise<{ result: Promise<HostShellResult>; kill(): void }> => {
+      const parsed = spec as { command: string; workdir: string; timeoutMs: number; signal?: AbortSignal }
+      const shell = process.platform === 'win32' ? 'cmd.exe' : '/bin/sh'
+      const flag = process.platform === 'win32' ? '/c' : '-c'
+      const child = spawn(shell, [flag, parsed.command], {
+        cwd: parsed.workdir,
+        env: process.env,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        // The real seam kills the process TREE (a shell holds the command); a
+        // direct kill would leave the grandchild running and hold this test
+        // process open.
+        detached: process.platform !== 'win32',
+      })
+      let stdout = ''
+      let stderr = ''
+      child.stdout?.on('data', (chunk: Uint8Array) => { stdout = appendCapped(stdout, Buffer.from(chunk).toString('utf8')) })
+      child.stderr?.on('data', (chunk: Uint8Array) => { stderr = appendCapped(stderr, Buffer.from(chunk).toString('utf8')) })
+      let timedOut = false
+      let aborted = false
+      const kill = (): void => {
+        try {
+          if (process.platform !== 'win32' && child.pid !== undefined) process.kill(-child.pid, 'SIGKILL')
+          else child.kill()
+        } catch { /* best effort */ }
+      }
+      const timer = parsed.timeoutMs > 0 ? setTimeout(() => { timedOut = true; kill() }, parsed.timeoutMs) : undefined
+      const onAbort = (): void => { aborted = true; kill() }
+      if (parsed.signal !== undefined) {
+        if (parsed.signal.aborted) onAbort()
+        else parsed.signal.addEventListener('abort', onAbort, { once: true })
+      }
+      const result = new Promise<HostShellResult>(resolve => {
+        child.on('error', (error: Error) => {
+          if (timer !== undefined) clearTimeout(timer)
+          parsed.signal?.removeEventListener('abort', onAbort)
+          // A failed spawn is a result with the reason on stderr, the way the
+          // real seam reports `killed` / `spawn failed`.
+          resolve({
+            exitCode: null,
+            signal: null,
+            timedOut,
+            aborted,
+            stdout: { text: stdout, truncated: false },
+            stderr: { text: `${stderr}spawn failed: ${error.message}`, truncated: false },
+          })
+        })
+        child.on('close', (code, signal) => {
+          if (timer !== undefined) clearTimeout(timer)
+          parsed.signal?.removeEventListener('abort', onAbort)
+          resolve({
+            exitCode: code,
+            signal: signal ?? null,
+            timedOut,
+            aborted,
+            // The seam echoes the timeout it APPLIED (after its own defaulting
+            // and capping), which is what a settlement message must name.
+            timeoutMs: parsed.timeoutMs,
+            stdout: { text: stdout, truncated: false },
+            stderr: { text: stderr, truncated: false },
+          })
+        })
+      })
+      return { result, kill }
+    },
+  }
+  return { executor: executor as unknown as HostShellExecutor, specs }
+}
+
+function makeFakeHost(options: { fsMap?: Record<string, string>, timeoutCapMs?: number } = {}): {
+  ctx: HostPluginContext
+  calls: FakeCall[]
+  shellSpecs: HostShellRequest[]
+  emit: (sessionId: string, type: string, data: unknown) => void
+} {
+  const shell = makeFakeShell(options.timeoutCapMs)
+  const fsMap = options.fsMap ?? {}
   const calls: FakeCall[] = []
   const inflight = new Map<string, HostAgent>() // by sessionId
   let seq = 0
@@ -131,7 +228,18 @@ function makeFakeHost(): { ctx: HostPluginContext; calls: FakeCall[]; emit: (ses
       },
     },
     webServer: { register: () => () => {} },
-    get: () => undefined,
+    get: (name: string) => {
+      if (name === 'shell') return shell.executor
+      if (name === 'fs') {
+        return {
+          // A LOCAL backend maps a path onto itself; a map entry overrides
+          // that, and an entry that is explicitly undefined models a path the
+          // deployment's execution world cannot reach.
+          processPathFromHostPath: (hostPath: string) => (Object.hasOwn(fsMap, hostPath) ? fsMap[hostPath] : hostPath),
+        }
+      }
+      return undefined
+    },
     on: (_event: 'session/event', listener: (session: { id: string }, event: { type: string; data: unknown }) => void) => {
       sessionListener = listener
       return () => {}
@@ -145,6 +253,7 @@ function makeFakeHost(): { ctx: HostPluginContext; calls: FakeCall[]; emit: (ses
   return {
     ctx,
     calls,
+    shellSpecs: shell.specs,
     emit: (sessionId, type, data) => { sessionListener?.({ id: sessionId }, { type, data }) },
     setResumeFailure: (v: boolean) => { resumeShouldFail = v },
     agentOf: (sessionId: string) => inflight.get(sessionId),
@@ -256,6 +365,25 @@ section('TimerRunner: workdir passes cwd to agents.create')
   await runner.tick()
   await new Promise(r => setTimeout(r, 25))
   check('agents.create received meta.cwd=workdir', host.calls.some(c => c.kind === 'create' && c.cwd === 'D:/work/proj'))
+}
+
+section('TimerRunner: workdir is recorded in the execution world')
+{
+  // A project workdir comes from the GUI's tree and names a host directory; a
+  // session header cwd is spelled the way the execution world spells it (a
+  // sandboxed deployment binds the project elsewhere). Local deployments map a
+  // path onto itself.
+  const host = makeFakeHost({ fsMap: { 'D:/work/proj': '/workspace/proj' } })
+  const s = new HostJobStore(join(tempDir, 'runner4b.json'))
+  const now = Date.UTC(2026, 0, 1)
+  const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
+  let job = createJob({ title: 'proj2', description: '', prompt: 'p', target: { workdir: 'D:/work/proj', sessionId: '' } }, now, 'job-e2')
+  job = withSchedule(job, { enabled: true, cron: '0 * * * *', nextRunAt: now - 1 }, now)
+  await s.mutate(jobs => ({ jobs: [...jobs, job], result: true }))
+  await runner.tick()
+  await new Promise(r => setTimeout(r, 25))
+  check('agents.create received the execution-world cwd', host.calls.some(c => c.kind === 'create' && c.cwd === '/workspace/proj'),
+    host.calls.filter(c => c.kind === 'create').map(c => c.cwd).join(','))
 }
 
 // ============================================================================
@@ -667,6 +795,113 @@ section('command: job model + ledger roundtrip')
     execReloaded?.executions[0]?.targeting === 'command'
     && execReloaded?.executions[0]?.exitCode === 0
     && execReloaded?.executions[0]?.output === 'hello')
+}
+
+section('TimerRunner: command job runs through the shell seam, not a raw spawn')
+{
+  // The mapping must land on a directory this host really has, because the
+  // fake executor spawns for real: the point is that the runner asks the seam
+  // for the execution-world spelling of the job's host workdir.
+  const hostDir = join(tempDir, 'seam-host')
+  const worldDir = join(tempDir, 'seam-world')
+  mkdirSync(hostDir, { recursive: true })
+  mkdirSync(worldDir, { recursive: true })
+  const host = makeFakeHost({ fsMap: { [hostDir]: worldDir } })
+  const s = new HostJobStore(join(tempDir, 'cmdseam.json'))
+  const now = Date.UTC(2026, 0, 1)
+  const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
+  const job = createJob({
+    title: 'seam-job', description: '', prompt: '',
+    kind: 'command', command: 'node', args: '-e "console.log(1 + 1)"',
+    target: { workdir: hostDir, sessionId: '' },
+  }, now, 'job-seam')
+  await s.mutate(jobs => ({ jobs: [job], result: true }))
+  check('manual seam run accepted', await runner.requestRun('job-seam') === true)
+  for (let i = 0; i < 40 && ((await s.load())[0]?.executions[0]?.endedAt === undefined); i++) {
+    await new Promise(r => setTimeout(r, 50))
+  }
+  const spec = host.shellSpecs[0]
+  const done = (await s.load())[0]
+  check('the command went through ctx.shell', spec !== undefined)
+  check('seam workdir is the execution-world path', spec?.workdir === worldDir, `${spec?.workdir}`)
+  check('seam command round-trips to the job argv',
+    JSON.stringify(splitCommandArgs(spec?.command ?? '')) === JSON.stringify(['node', '-e', 'console.log(1 + 1)']), spec?.command)
+  check('seam request carries the byte capture budget', spec?.stdoutMaxBytes === OUTPUT_TAIL_BYTES,
+    `${spec?.stdoutMaxBytes}`)
+  check('seamed run settles succeeded with its output',
+    done?.executions[0]?.result === 'succeeded' && (done?.executions[0]?.output ?? '').includes('2'),
+    `${done?.executions[0]?.result}/${done?.executions[0]?.output}`)
+  check('seamed run created no agent session', !host.calls.some(c => c.kind === 'create' || c.kind === 'resume'))
+}
+
+section('TimerRunner: a workdir the execution world cannot reach fails the run')
+{
+  // The fs provider answers `undefined` when the path is unreachable in its
+  // world (a sandbox that binds the project elsewhere); running with the host
+  // spelling instead would point the command or the session at a directory that
+  // does not exist there.
+  const hostDir = join(tempDir, 'unreachable-host')
+  mkdirSync(hostDir, { recursive: true })
+  const fsMap: Record<string, string> = {}
+  Object.defineProperty(fsMap, hostDir, { value: undefined, enumerable: true, configurable: true })
+  const host = makeFakeHost({ fsMap })
+  const s = new HostJobStore(join(tempDir, 'unreachable.json'))
+  const now = Date.UTC(2026, 0, 1)
+  const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
+  const commandJob = createJob({
+    title: 'unreachable-cmd', description: '', prompt: '',
+    kind: 'command', command: 'node', args: '-e "1"',
+    target: { workdir: hostDir, sessionId: '' },
+  }, now, 'job-unreachable-cmd')
+  const agentJob = createJob({
+    title: 'unreachable-agent', description: '', prompt: 'p',
+    target: { workdir: hostDir, sessionId: '' },
+  }, now, 'job-unreachable-agent')
+  await s.mutate(jobs => ({ jobs: [commandJob, agentJob], result: true }))
+  await runner.requestRun('job-unreachable-cmd')
+  await runner.requestRun('job-unreachable-agent')
+  for (let i = 0; i < 40 && (await s.load()).some(j => j.executions[0]?.endedAt === undefined); i++) {
+    await new Promise(r => setTimeout(r, 50))
+  }
+  const done = await s.load()
+  const cmd = done.find(j => j.id === 'job-unreachable-cmd')
+  const agent = done.find(j => j.id === 'job-unreachable-agent')
+  check('unreachable workdir fails the command job without starting it',
+    cmd?.status === 'failed' && (cmd?.executions[0]?.error ?? '').includes('not reachable in this deployment\'s execution world'),
+    `${cmd?.status}/${cmd?.executions[0]?.error}`)
+  check('the unreachable command never reached ctx.shell', host.shellSpecs.length === 0)
+  check('unreachable workdir fails the agent job without creating a session',
+    agent?.status === 'failed' && (agent?.executions[0]?.error ?? '').includes('not reachable in this deployment\'s execution world')
+      && !host.calls.some(c => c.kind === 'create'),
+    `${agent?.status}/${agent?.executions[0]?.error}`)
+}
+
+section('TimerRunner: the timeout message names the timeout that was applied')
+{
+  // A deployment caps the deadline; a job that asked for more (or for none) is
+  // cut short by the applied value, so that is the one the record must name.
+  const host = makeFakeHost({ timeoutCapMs: 300 })
+  const s = new HostJobStore(join(tempDir, 'applied-timeout.json'))
+  const now = Date.UTC(2026, 0, 1)
+  const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
+  const job = {
+    ...createJob({
+      title: 'capped', description: '', prompt: '',
+      kind: 'command', command: 'node', args: '-e "setTimeout(()=>{}, 600000)"',
+      target: { workdir: '', sessionId: '' },
+    }, now, 'job-capped'),
+    timeoutMs: 120_000,
+  }
+  await s.mutate(jobs => ({ jobs: [job], result: true }))
+  await runner.requestRun('job-capped')
+  for (let i = 0; i < 60 && ((await s.load())[0]?.executions[0]?.endedAt === undefined); i++) {
+    await new Promise(r => setTimeout(r, 50))
+  }
+  const done = (await s.load())[0]
+  check('capped run times out', done?.status === 'failed' && (done?.executions[0]?.error ?? '').includes('timed out'),
+    `${done?.status}/${done?.executions[0]?.error}`)
+  check('the message names the applied timeout, not the requested one',
+    !(done?.executions[0]?.error ?? '').includes('120s'), `${done?.executions[0]?.error}`)
 }
 
 section('TimerRunner: command job fires the real process (success + failure + output)')

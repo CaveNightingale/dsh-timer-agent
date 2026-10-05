@@ -73,8 +73,42 @@ export function splitCommandArgs(input: string): string[] {
 /** Hard cap on captured output kept in memory per stream (bytes-ish). */
 const CAPTURE_CAP = 128 * 1024
 
+/** Shell-special-free characters that need no quoting. */
+const BARE_ARG = /^[A-Za-z0-9_@%+=:,./-]+$/
+
+/** One argv entry as a single-quoted POSIX word (nothing expands inside). */
+function quoteArg(arg: string): string {
+  if (arg === '') return "''"
+  if (BARE_ARG.test(arg)) return arg
+  return `'${arg.replaceAll("'", "'\\''")}'`
+}
+
+/**
+ * Render argv as one POSIX shell command line.
+ *
+ * The execution seams that confine a command (`ctx.shell`, and therefore a
+ * sandboxing executor such as dsh-bwrap-sandbox's) take a command STRING, not
+ * argv. Each entry is quoted so the shell hands it to the program byte for
+ * byte — `splitCommandArgs` turns the string back into the same argv.
+ *
+ * @param argv - the executable followed by its arguments.
+ * @returns a command line that runs exactly that argv.
+ */
+export function joinCommandArgs(argv: readonly string[]): string {
+  return argv.map(quoteArg).join(' ')
+}
+
 /** What a settled command execution keeps in the ledger. */
 export const OUTPUT_TAIL_CHARS = 16_000
+
+/**
+ * Bytes the shell seam may capture for one job's stdout.
+ *
+ * The seam's capture budget is BYTES while the ledger's tail is CHARACTERS, so
+ * four bytes per kept character — the UTF-8 worst case — keeps the seam from
+ * cutting a multi-byte tail short before `truncateOutputTail` sees it.
+ */
+export const OUTPUT_TAIL_BYTES = OUTPUT_TAIL_CHARS * 4
 
 /**
  * Keep the tail of a captured output blob (the interesting part of a long
