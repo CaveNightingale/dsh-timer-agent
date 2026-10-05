@@ -24,6 +24,7 @@ import { spawn } from 'node:child_process'
 import { isValidCron, nextRunAtMs } from '../src/core/schedule.ts'
 import { appendCapped, splitCommandArgs, truncateOutputTail, OUTPUT_TAIL_BYTES } from '../src/core/command.ts'
 import { HostJobStore } from '../src/host/store.ts'
+import { apply as applyTimerPlugin, inject } from '../src/index.ts'
 import { TimerRunner } from '../src/host/runner.ts'
 import { registerTimerTool } from '../src/host/tools.ts'
 import { makeRoutes } from '../src/host/routes.ts'
@@ -902,6 +903,65 @@ section('TimerRunner: the timeout message names the timeout that was applied')
     `${done?.status}/${done?.executions[0]?.error}`)
   check('the message names the applied timeout, not the requested one',
     !(done?.executions[0]?.error ?? '').includes('120s'), `${done?.executions[0]?.error}`)
+}
+
+section('plugin apply: mounts without a web server, and registers routes when there is one')
+{
+  // A bot or headless profile has no `webServer` (that service belongs to
+  // `dsh web`). The engine, the model tool, and the announcement must mount
+  // there anyway: a hard `inject` on that service holds the whole plugin
+  // `pending`, which reads in every conversation as "the tool does not exist".
+  check('webServer is not an injected dependency', !inject.includes('webServer'), inject.join(','))
+  check('the engine still requires the services it cannot work without',
+    ['agents', 'tools', 'systemPrompt', 'settings'].every(service => inject.includes(service)), inject.join(','))
+
+  let registeredRoutes = 0
+  const applyOnce = (withWebServer: boolean): { tool: boolean; section: boolean } => {
+    const state = { tool: false, section: false }
+    const webServer = { register: () => { registeredRoutes += 1; return () => {} } }
+    const ctx = {
+      agents: { get: () => undefined, resume: async () => { throw new Error('none') }, create: async () => { throw new Error('none') } },
+      settings: {
+        installSection: (_c: unknown, _ns: string, _s: unknown, _e: unknown, hooks: { setSource(current: () => unknown): void }) => {
+          hooks.setSource(() => ({ enabled: true, announceToAgent: true }))
+        },
+      },
+      ...(withWebServer ? { webServer } : {}),
+      get: (service: string) => (withWebServer && service === 'webServer' ? webServer : undefined),
+      tools: { register: () => { state.tool = true; return () => {} } },
+      systemPrompt: { section: () => { state.section = true; return () => {} } },
+      effect: (fn: () => (() => void) | void) => {
+        const dispose = fn()
+        return () => { if (typeof dispose === 'function') dispose() }
+      },
+      on: () => () => {},
+    }
+    // The engine starts a 60s ticker; keep it out of the test process's handle
+    // set so the suite still exits on its own.
+    const realSetInterval = globalThis.setInterval
+    const timers: ReturnType<typeof setInterval>[] = []
+    globalThis.setInterval = ((fn: () => void, ms?: number) => {
+      const timer = realSetInterval(fn, ms)
+      timers.push(timer)
+      return timer
+    }) as typeof setInterval
+    try {
+      applyTimerPlugin(ctx as never, { enabled: true, announceToAgent: true })
+    } finally {
+      globalThis.setInterval = realSetInterval
+      for (const timer of timers) clearInterval(timer)
+    }
+    return state
+  }
+
+  const headless = applyOnce(false)
+  check('without webServer the model tool still registers', headless.tool)
+  check('without webServer the announcement still registers', headless.section)
+  check('without webServer no route registers', registeredRoutes === 0)
+
+  const web = applyOnce(true)
+  check('with webServer the model tool still registers', web.tool)
+  check('with webServer the routes register', registeredRoutes > 0, `${registeredRoutes}`)
 }
 
 section('TimerRunner: command job fires the real process (success + failure + output)')

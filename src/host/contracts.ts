@@ -400,8 +400,11 @@ declare module '@deepseek-ai/cordis' {
   interface Context {
     /** The host agent registry; required via `inject`. */
     agents: HostAgentRegistry
-    /** The host webserver route surface; required via `inject`. */
-    webServer: HostWebServer
+    /**
+     * The host webserver route surface. NOT injected: only the web GUI needs the
+     * routes, and a bot or headless profile has no webserver at all.
+     */
+    webServer?: HostWebServer
     /** The host settings provider; required via `inject` (dsh 0.1.2+). */
     settings: HostSettings
   }
@@ -418,7 +421,8 @@ declare module '@deepseek-ai/cordis' {
  */
 export interface HostPluginContext {
   agents: HostAgentRegistry
-  webServer: HostWebServer
+  /** The host webserver, when mounted ('webServer'); the routes serve the web GUI only. */
+  webServer?: HostWebServer
   /** The host settings provider, required via `inject` ('settings'). */
   settings: HostSettings
   /** The host default-model service, when mounted ('agentDefaultModel'). */

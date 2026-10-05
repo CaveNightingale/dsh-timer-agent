@@ -2,7 +2,7 @@
 
 中文 | [English](./README.en.md)
 
-一个 [DeepSeek Harness (DSH)](https://github.com/) Web GUI 插件:调研 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) 的 cron 系统后,按其「定时器 ↔ Agent 协同」思路实现的 **host 常驻定时任务引擎**——`dsh web` 服务启动即生效,**GUI 页面关闭也照常触发**。
+一个 [DeepSeek Harness (DSH)](https://github.com/) 插件:调研 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) 的 cron 系统后,按其「定时器 ↔ Agent 协同」思路实现的 **host 常驻定时任务引擎**——**宿主进程启动即生效**(任何挂了本插件的 profile:`dsh web`、bot(如 dsh-qqbot)、headless 都一样),**GUI 页面关闭也照常触发**;Web GUI 侧边栏面板只是三个入口之一,没挂 `webServer` 的 profile 里 ticker、`timer_agent` 工具、system-prompt 提示照常工作,只是没有面板和回环 API。
 
 ![新建任务弹窗:项目/会话树 + Agent 预设 + cron 定时(截图数据已脱敏)](docs/screenshot.png)
 
@@ -29,7 +29,7 @@
 ## 架构(hermes-agent cron 同构)
 
 ```
-┌─ dsh web 宿主进程 ────────────────────────────────┐
+┌─ 宿主进程 (dsh web / bot / headless) ─────────────┐
 │  60s ticker(常驻,GUI 关闭也运行)                  │
 │   ├─ HostJobStore   ~/.dsh/timer-agent/jobs.json  │
 │   │                 (原子写,损坏降级不崩溃)        │
@@ -96,7 +96,9 @@
 dsh plugin --profile web add link:<本目录绝对路径>
 ```
 
-安装后**重启 `dsh web`**,侧边栏出现「定时任务」入口即生效(浏览器侧改动强刷 `Ctrl+F5` 即可)。
+安装后**重启宿主进程**(`dsh web`、`dsh --profile <bot> …`、headless 同理)即生效:对话里 `timer_agent` 工具可用、到期任务照常触发。挂在 `dsh web` 时侧边栏另出现「定时任务」入口(浏览器侧改动强刷 `Ctrl+F5` 即可);挂在 bot / headless profile 时没有面板与回环 API,其余行为一致。
+
+安装到非 web profile 用同一个命令换 profile 名即可(如 `dsh plugin --profile qqbot add link:<本目录绝对路径>`);台账 `~/.dsh/timer-agent/jobs.json` 是进程共享的,多个 profile 各自跑 ticker 会用同一份台账(建议只在一个常驻 profile 里挂本插件)。
 
 ## Configuration
 
@@ -138,7 +140,7 @@ E2E 覆盖:cron 解析与下次运行计算(本地时间语义)、台账原子�
 
 | hermes-agent | 本插件 |
 |---|---|
-| gateway 进程内 60s ticker | `dsh web` 宿主进程内 60s ticker |
+| gateway 进程内 60s ticker | 宿主进程内 60s ticker(任何挂了本插件的 profile) |
 | 触发即新 AIAgent(platform=cron) 会话 | `agents.create`/`resume` 真实 dsh 会话 |
 | ~/.hermes/cron/jobs.json 台账 | ~/.dsh/timer-agent/jobs.json(原子写) |
 | at-most-once(先推进 next_run_at) | 先顺延 nextRunAt 再触发 |
@@ -165,16 +167,17 @@ E2E 覆盖:cron 解析与下次运行计算(本地时间语义)、台账原子�
 
 - **文件**：任务台账 `~/.dsh/timer-agent/jobs.json` 的原子读写（store）；不触碰 dsh 核心目录与其他 Profile 文件
 - **命令**：`command` 型任务经 `ctx.shell` 执行任务作者填写的命令（cwd 可指定 workdir，按执行世界的拼写解析；环境继承宿主 `process.env`）；`prompt` 型任务通过 dsh session API 执行，不直接起 shell
-- **网络**：仅 localhost —— web GUI 调用同源 `/api/dsh-timer-agent/*` 路由 + 宿主经 dsh client 调用本地 dsh 服务；不连任何外部服务
+- **网络**：挂了 `webServer` 时仅 localhost —— web GUI 调用同源 `/api/dsh-timer-agent/*` 路由 + 宿主经 dsh client 调用本地 dsh 服务；不连任何外部服务（未挂 `webServer` 的 profile 没有路由，也不再是硬依赖）
 - **凭据**：子进程继承宿主 `process.env`（dsh 凭据经环境变量传递给 CLI）；插件自身不读取、不记录、不持久化任何凭据或密钥
 
-**失败边界**：服务进程停止即不触发（错过即跳过）；台账损坏时降级为空表并备份原文件；运行中到点跳过本次；手动触发与 ticker 触发经同一 at-most-once 通道，不会重复执行。
+**失败边界**：宿主进程停止即不触发（错过即跳过）；台账损坏时降级为空表并备份原文件；运行中到点跳过本次；手动触发与 ticker 触发经同一 at-most-once 通道，不会重复执行。
 
 **源码版本锚**：v0.7.0 发布于 tag `v0.7.0`。
 
 ## 已知限制
 
-- 定时执行依赖 `dsh web` 服务进程存活(服务停了自然不触发;重启后只跑已顺延到期的任务,错过即跳过)
+- 定时执行依赖宿主进程存活(进程停了自然不触发;重启后只跑已顺延到期的任务,错过即跳过)
+- 同一台账被多个进程共读时(例如同时在 `web` 和 bot profile 里挂了本插件)会各自触发,请只在一个常驻 profile 里挂载
 - 任务运行中到点跳过本次,等下一个 cron 匹配点
 - 执行消耗 API 额度;定时执行无人在场,prompt 必须自包含、不可提问
 

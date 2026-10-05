@@ -2,7 +2,7 @@
 
 [中文](./README.md) | English
 
-A [DeepSeek Harness (DSH)](https://github.com/) Web GUI plugin: a **host-resident scheduled-jobs engine** built after studying the cron system of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) and following its "timer ↔ agent coordination" design. It is live the moment the `dsh web` service starts — **it keeps firing with the GUI page closed**.
+A [DeepSeek Harness (DSH)](https://github.com/) plugin: a **host-resident scheduled-jobs engine** built after studying the cron system of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) and following its "timer ↔ agent coordination" design. It is live the moment the **host process starts**, in any profile that mounts it (`dsh web`, a bot profile such as dsh-qqbot, headless — all the same) — **it keeps firing with the GUI page closed**. The web GUI sidebar panel is one of three doorways; in a profile with no `webServer` the ticker, the `timer_agent` tool, and the system-prompt note work all the same, only the panel and the loopback API are absent.
 
 ![New-job modal: project/session tree + agent presets + cron schedule (screenshot data masked)](docs/screenshot.png)
 
@@ -29,7 +29,7 @@ Manage jobs right from any conversation with the `timer_agent` tool (create / li
 ## Architecture (isomorphic to hermes-agent cron)
 
 ```
-┌─ dsh web host process ────────────────────────────┐
+┌─ host process (dsh web / bot / headless) ─────────┐
 │  60s ticker (resident; runs with GUI closed)      │
 │   ├─ HostJobStore   ~/.dsh/timer-agent/jobs.json  │
 │   │                 (atomic writes, degrades safe)│
@@ -98,7 +98,9 @@ Adapts to **dsh 0.1.5-rc.2** (up from v0.6.0's dsh 0.1.2-rc.1; the host plugin s
 dsh plugin --profile web add link:<absolute path to this directory>
 ```
 
-Then **restart `dsh web`**; the sidebar「定时任务」entry confirms it is live (browser-side changes need a `Ctrl+F5` force refresh).
+Then **restart the host process** (`dsh web`, `dsh --profile <bot> …`, headless — all the same): the `timer_agent` tool becomes available to conversations and due jobs fire. Under `dsh web` the sidebar「定时任务」entry additionally appears (browser-side changes need a `Ctrl+F5` force refresh); in a bot or headless profile there is no panel and no loopback API, and everything else behaves identically.
+
+Target another profile with the same command (`dsh plugin --profile qqbot add link:<absolute path to this directory>`). The ledger `~/.dsh/timer-agent/jobs.json` is shared per user, so mounting the plugin in more than one long-running profile makes each process fire the same jobs — mount it in exactly one.
 
 ## Build
 
@@ -116,7 +118,7 @@ The E2E suite covers: cron parsing and next-run computation (local-time semantic
 
 | hermes-agent | this plugin |
 |---|---|
-| in-process 60s ticker in gateway | 60s ticker in the `dsh web` host process |
+| in-process 60s ticker in gateway | 60s ticker in the host process (any profile that mounts this plugin) |
 | fire → new AIAgent(platform=cron) session | `agents.create`/`resume` real dsh sessions |
 | ~/.hermes/cron/jobs.json ledger | ~/.dsh/timer-agent/jobs.json (atomic writes) |
 | at-most-once (advance next_run_at first) | roll nextRunAt forward before firing |
@@ -146,13 +148,14 @@ The E2E suite covers: cron parsing and next-run computation (local-time semantic
 - **Network**: localhost only — the web GUI calls same-origin `/api/dsh-timer-agent/*` routes and the host talks to the local dsh service via the dsh client; no external services
 - **Credentials**: spawned children inherit host `process.env` (dsh credentials reach the CLI via env vars); the plugin itself never reads, logs, or persists credentials or secrets
 
-**Failure bounds**: a stopped service process fires nothing (missed means missed); a corrupted ledger degrades to an empty table with the original file backed up; a mid-run due slot skips; manual and ticker triggers share one at-most-once channel and never double-execute.
+**Failure bounds**: a stopped host process fires nothing (missed means missed); a corrupted ledger degrades to an empty table with the original file backed up; a mid-run due slot skips; manual and ticker triggers share one at-most-once channel and never double-execute.
 
 **Source anchor**: v0.7.0 released at tag `v0.7.0`.
 
 ## Known limits
 
-- Firing depends on the `dsh web` service process being alive (a stopped service fires nothing; after restart only already-rolled-forward due jobs run — missed means missed)
+- Firing depends on the host process being alive (a stopped process fires nothing; after restart only already-rolled-forward due jobs run — missed means missed)
+- One ledger read by several processes (e.g. the plugin mounted in both a `web` and a bot profile) fires each job once per process — mount it in exactly one long-running profile
 - A job that is mid-run at its due point skips that slot and waits for the next cron match
 - Executions consume API quota; scheduled runs have no human present — prompts must be self-contained and must not ask questions
 

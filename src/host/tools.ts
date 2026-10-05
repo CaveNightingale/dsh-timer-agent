@@ -115,8 +115,8 @@ export function registerTimerTool(tools: { register(def: unknown): () => void },
   return tools.register(defineTool({
     name: 'timer_agent',
     description: [
-      'Manage scheduled timer jobs that fire on a cron schedule (the dsh-timer-agent engine; the same jobs appear in the web GUI「定时任务」panel).',
-      "Two job kinds: kind='agent' (default) fires a real agent session from a self-contained prompt; kind='command' (普通任务) runs command+args through the deployment's shell executor with no AI — use it for scripts that just need a timer.",
+      'Manage scheduled timer jobs that fire on a cron schedule (the dsh-timer-agent engine; the web GUI sidebar panel manages the same jobs).',
+      "Two job kinds: kind='agent' (default) fires a real agent session from a self-contained prompt; kind='command' runs command+args through the deployment's shell executor with no AI — use it for scripts that just need a timer.",
       "action='create' schedules a new job (requires schedule; agent jobs also require prompt — self-contained, scheduled runs get no current-chat context unless session is pinned; command jobs require command instead).",
       "action='list' shows all jobs; action='update' edits prompt/schedule/name/command/args; action='pause'/'resume' arms/disarms the schedule; action='archive' freezes a job (no schedule fires, no manual runs) and action='restart' un-archives it back to idle; action='remove' deletes; action='run' fires immediately in the background (returns at once).",
       "schedule syntax: 5-field cron like '0 9 * * *' (min hour day month weekday), OR pass interval_minutes instead for a fixed interval from the last trigger (e.g. every 302 minutes — a cadence a cron grid cannot express), OR pass run_at alone for a ONE-SHOT job that fires once at that instant and archives afterwards (a manual run spends the shot too).",
@@ -141,7 +141,7 @@ export function registerTimerTool(tools: { register(def: unknown): () => void },
       },
       kind: {
         type: 'string',
-        description: "For create/update: job kind — 'agent' (default; AI session executes prompt) or 'command' (普通任务; spawns command+args directly, no AI).",
+        description: "For create/update: job kind — 'agent' (default; AI session executes prompt) or 'command' (spawns command+args directly, no AI).",
       },
       command: {
         type: 'string',
