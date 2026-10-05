@@ -19,7 +19,7 @@ interface Config {
 declare const Config: z<Config>;
 /**
  * Mount the engine: ticker + runner, tool, routes, announcement.
- * @param ctx - host plugin context (tools/systemPrompt/agents/settings, plus an optional webServer).
+ * @param ctx - host plugin context (tools/systemPrompt/agents, plus optional settings and webServer).
  * @param config - resolved plugin config.
  */
 declare function apply(ctx: Context, config?: Config): void;

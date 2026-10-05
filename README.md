@@ -157,6 +157,12 @@ E2E 覆盖:cron 解析与下次运行计算(本地时间语义)、台账原子�
 - Node.js：`>=22`（`engines.node`；仓库内测试依赖 Node 22+ 的 type-stripping 能力）
 - 系统：开发验证环境为 Windows 10/11；macOS/Linux 未验证
 
+**宿主面按代适配**：插件只把 `tools` / `systemPrompt` / `agents` 作为硬依赖，其余宿主面取到就用、取不到照样挂载：
+
+- **设置缝两代都支持**：旧缝（dsh 0.1.5-rc.2 的 `SettingsProvider.installSection`）用它把本插件的 entry 注册成命名空间基底，并通过 hooks 接收实时配置；新缝（`SettingsForms`，`installSection` 已不存在）由 Loader 自动投影每个 entry 的 Config，配置改动会重新 apply 本插件，插件无需注册——检测到没有 `installSection` 就跳过，不会抛错
+- **没有 `settings` 服务**（bot / headless profile）时插件照常挂载，`enabled` / `announceToAgent` 只能来自 `cordis.yml`，改配置需重启
+- **没有 `webServer`**（非 `dsh web` profile）时没有侧边栏面板与回环 API，ticker、`timer_agent` 工具、system-prompt 提示照常工作
+
 **依赖**：
 
 - 运行时依赖仅 `schemastery`（配置 schema 校验），随包安装，无 install/postinstall/prepare 生命周期脚本

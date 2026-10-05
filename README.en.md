@@ -135,6 +135,12 @@ The E2E suite covers: cron parsing and next-run computation (local-time semantic
 - Node.js: `>=22` (`engines.node`; the repo's tests rely on Node 22+ type-stripping)
 - OS: verified on Windows 10/11; macOS/Linux unverified
 
+**Host faces adapt per generation**: only `tools` / `systemPrompt` / `agents` are hard dependencies; every other host face is used when present and skipped when absent:
+
+- **Both settings seams work**: the older one (dsh 0.1.5-rc.2's `SettingsProvider.installSection`) registers this plugin's entry as the namespace base layer and pushes live config back through its hooks; the newer one (`SettingsForms`, which has no `installSection`) has the Loader project every entry's Config and re-applies the plugin when the profile patch changes, so the plugin registers nothing — a missing `installSection` is skipped, never called
+- **No `settings` service** (bot / headless profile): the plugin mounts anyway; `enabled` / `announceToAgent` then come from `cordis.yml` and a change needs a restart
+- **No `webServer`** (any profile but `dsh web`): no sidebar panel and no loopback API; the ticker, the `timer_agent` tool, and the system-prompt note work as usual
+
 **Dependencies**:
 
 - Single runtime dependency `schemastery` (config schema validation), installed with the package; no install/postinstall/prepare lifecycle scripts

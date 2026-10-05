@@ -24,7 +24,7 @@ import { spawn } from 'node:child_process'
 import { isValidCron, nextRunAtMs } from '../src/core/schedule.ts'
 import { appendCapped, splitCommandArgs, truncateOutputTail, OUTPUT_TAIL_BYTES } from '../src/core/command.ts'
 import { HostJobStore } from '../src/host/store.ts'
-import { apply as applyTimerPlugin, inject } from '../src/index.ts'
+import { apply as applyTimerPlugin, Config, inject } from '../src/index.ts'
 import { TimerRunner } from '../src/host/runner.ts'
 import { registerTimerTool } from '../src/host/tools.ts'
 import { makeRoutes } from '../src/host/routes.ts'
@@ -905,63 +905,102 @@ section('TimerRunner: the timeout message names the timeout that was applied')
     !(done?.executions[0]?.error ?? '').includes('120s'), `${done?.executions[0]?.error}`)
 }
 
-section('plugin apply: mounts without a web server, and registers routes when there is one')
+section('plugin apply: mounts against every host face generation it supports')
 {
   // A bot or headless profile has no `webServer` (that service belongs to
-  // `dsh web`). The engine, the model tool, and the announcement must mount
-  // there anyway: a hard `inject` on that service holds the whole plugin
-  // `pending`, which reads in every conversation as "the tool does not exist".
+  // `dsh web`), and the settings seam changed shape after dsh 0.1.5-rc.2. Both
+  // are optional integrations: a hard `inject` or an unconditional method call
+  // leaves the whole plugin `pending` or throws, which reads in every
+  // conversation as "the tool does not exist".
   check('webServer is not an injected dependency', !inject.includes('webServer'), inject.join(','))
+  check('settings is not an injected dependency', !inject.includes('settings'), inject.join(','))
   check('the engine still requires the services it cannot work without',
-    ['agents', 'tools', 'systemPrompt', 'settings'].every(service => inject.includes(service)), inject.join(','))
+    ['agents', 'tools', 'systemPrompt'].every(service => inject.includes(service)), inject.join(','))
 
-  let registeredRoutes = 0
-  const applyOnce = (withWebServer: boolean): { tool: boolean; section: boolean } => {
-    const state = { tool: false, section: false }
-    const webServer = { register: () => { registeredRoutes += 1; return () => {} } }
+  interface ApplyState {
+    tool: number
+    section: number
+    routes: number
+    installSectionCalls: { ns: string; entry: unknown; schema: unknown }[]
+    onChange: () => void
+  }
+
+  // The engine starts a 60s ticker and a 5s request poll; keep them out of the
+  // test process's handle set so the suite still exits on its own. Every call
+  // that mounts or re-syncs the engine runs inside this wrapper.
+  const withSuppressedTimers = <T>(fn: () => T): T => {
+    const realSetInterval = globalThis.setInterval
+    const timers: ReturnType<typeof setInterval>[] = []
+    globalThis.setInterval = ((handler: () => void, ms?: number) => {
+      const timer = realSetInterval(handler, ms)
+      timers.push(timer)
+      return timer
+    }) as typeof setInterval
+    try {
+      return fn()
+    } finally {
+      globalThis.setInterval = realSetInterval
+      for (const timer of timers) clearInterval(timer)
+    }
+  }
+
+  const applyOnce = (host: 'no-settings' | 'legacy-settings' | 'forms-settings', withWebServer: boolean): ApplyState => {
+    const state: ApplyState = { tool: 0, section: 0, routes: 0, installSectionCalls: [], onChange: () => {} }
+    const webServer = { register: () => { state.routes += 1; return () => {} } }
+    // dsh 0.1.7-rc.2's settings seam: forms projected from the Loader entries.
+    const formsSettings = { writable: true, describe: () => [], configure: () => () => {} }
+    const legacySettings = {
+      installSection: (_c: unknown, ns: string, schema: unknown, entry: unknown, hooks: { setSource(current: () => unknown): void; onChange(): void }) => {
+        state.installSectionCalls.push({ ns, entry, schema })
+        state.onChange = hooks.onChange
+        hooks.setSource(() => ({ enabled: true, announceToAgent: true }))
+      },
+    }
     const ctx = {
       agents: { get: () => undefined, resume: async () => { throw new Error('none') }, create: async () => { throw new Error('none') } },
-      settings: {
-        installSection: (_c: unknown, _ns: string, _s: unknown, _e: unknown, hooks: { setSource(current: () => unknown): void }) => {
-          hooks.setSource(() => ({ enabled: true, announceToAgent: true }))
-        },
-      },
       ...(withWebServer ? { webServer } : {}),
-      get: (service: string) => (withWebServer && service === 'webServer' ? webServer : undefined),
-      tools: { register: () => { state.tool = true; return () => {} } },
-      systemPrompt: { section: () => { state.section = true; return () => {} } },
+      ...(host === 'legacy-settings' ? { settings: legacySettings } : host === 'forms-settings' ? { settings: formsSettings } : {}),
+      get: (service: string) => {
+        if (withWebServer && service === 'webServer') return webServer
+        if (service === 'settings') return host === 'legacy-settings' ? legacySettings : host === 'forms-settings' ? formsSettings : undefined
+        return undefined
+      },
+      tools: { register: () => { state.tool += 1; return () => {} } },
+      systemPrompt: { section: () => { state.section += 1; return () => {} } },
       effect: (fn: () => (() => void) | void) => {
         const dispose = fn()
         return () => { if (typeof dispose === 'function') dispose() }
       },
       on: () => () => {},
     }
-    // The engine starts a 60s ticker; keep it out of the test process's handle
-    // set so the suite still exits on its own.
-    const realSetInterval = globalThis.setInterval
-    const timers: ReturnType<typeof setInterval>[] = []
-    globalThis.setInterval = ((fn: () => void, ms?: number) => {
-      const timer = realSetInterval(fn, ms)
-      timers.push(timer)
-      return timer
-    }) as typeof setInterval
-    try {
-      applyTimerPlugin(ctx as never, { enabled: true, announceToAgent: true })
-    } finally {
-      globalThis.setInterval = realSetInterval
-      for (const timer of timers) clearInterval(timer)
-    }
+    // The engine starts its timers inside `apply`; the wrapper below owns them.
+    withSuppressedTimers(() => { applyTimerPlugin(ctx as never, { enabled: true, announceToAgent: true }) })
     return state
   }
 
-  const headless = applyOnce(false)
-  check('without webServer the model tool still registers', headless.tool)
-  check('without webServer the announcement still registers', headless.section)
-  check('without webServer no route registers', registeredRoutes === 0)
+  // Hosts a profile can actually present: no settings service at all (bot
+  // profiles), the pre-0.1.7 `SettingsProvider.installSection` shape, and the
+  // `SettingsForms` shape that has no `installSection` — the case that threw.
+  for (const host of ['no-settings', 'legacy-settings', 'forms-settings'] as const) {
+    const headless = applyOnce(host, false)
+    check(`[${host}] the model tool registers`, headless.tool === 1, `${headless.tool}`)
+    check(`[${host}] the announcement registers`, headless.section === 1, `${headless.section}`)
+    check(`[${host}] no route registers without a webServer`, headless.routes === 0, `${headless.routes}`)
+    check(`[${host}] live config registration matches the seam`,
+      headless.installSectionCalls.length === (host === 'legacy-settings' ? 1 : 0), `${headless.installSectionCalls.length}`)
+  }
 
-  const web = applyOnce(true)
-  check('with webServer the model tool still registers', web.tool)
-  check('with webServer the routes register', registeredRoutes > 0, `${registeredRoutes}`)
+  const legacy = applyOnce('legacy-settings', false)
+  check('legacy seam: the namespace, schema, and entry come from the plugin',
+    legacy.installSectionCalls[0]?.ns === 'timer-agent' && legacy.installSectionCalls[0]?.schema === Config
+    && JSON.stringify(legacy.installSectionCalls[0]?.entry) === JSON.stringify({ enabled: true, announceToAgent: true }),
+    JSON.stringify(legacy.installSectionCalls[0]?.entry))
+  withSuppressedTimers(() => { legacy.onChange() })
+  check('legacy seam: a settings change re-registers the tool and section',
+    legacy.tool === 2 && legacy.section === 2, `tool=${legacy.tool} section=${legacy.section}`)
+  const web = applyOnce('forms-settings', true)
+  check('with webServer the model tool still registers', web.tool === 1, `${web.tool}`)
+  check('with webServer the routes register', web.routes > 0, `${web.routes}`)
 }
 
 section('TimerRunner: command job fires the real process (success + failure + output)')

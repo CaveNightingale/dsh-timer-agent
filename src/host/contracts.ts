@@ -353,11 +353,12 @@ export interface HostSettingsSectionHooks<T> {
 }
 
 /**
- * The `settings` service (subset of the host `SettingsProvider`): namespace
- * registration for optional-settings consumers. Mirrors
- * `SettingsProvider.installSection` as of dsh 0.1.5-rc.2 — the same five-param
- * shape dsh 0.1.2 introduced (`installSettingsSection` helper long gone;
- * the hooks' `validate?` member stays optional and unused here).
+ * The `settings` service, when it offers namespace registration: the shape dsh
+ * 0.1.5-rc.2 exposed as `SettingsProvider.installSection` (five params, as dsh
+ * 0.1.2 introduced them; the hooks' `validate?` member stays optional and unused
+ * here). The later `SettingsForms` seam has no such method — its descriptor list
+ * comes from the Loader entries themselves — so the member is optional and the
+ * plugin works with either generation.
  */
 export interface HostSettings {
   /**
@@ -369,7 +370,7 @@ export interface HostSettings {
    * @param entry - composition entry used as the base and fallback value.
    * @param hooks - source sink and change notification.
    */
-  installSection<T>(
+  installSection?<T>(
     owner: object,
     ns: string,
     schema: z<T>,
@@ -405,8 +406,14 @@ declare module '@deepseek-ai/cordis' {
      * routes, and a bot or headless profile has no webserver at all.
      */
     webServer?: HostWebServer
-    /** The host settings provider; required via `inject` (dsh 0.1.2+). */
-    settings: HostSettings
+    /**
+     * The host settings service, when mounted. NOT injected, and not required at
+     * runtime: `installSection` is a member of the older seam only, and a dsh
+     * without it carries the plugin's Config through the profile entry instead
+     * (dsh 0.1.7-rc.2 replaced `installSection` with `SettingsForms`, which
+     * projects every entry's Config and needs no consumer registration).
+     */
+    settings?: HostSettings
   }
   interface Events {
     /** Durable session facts broadcast by the host session store. */
@@ -423,8 +430,8 @@ export interface HostPluginContext {
   agents: HostAgentRegistry
   /** The host webserver, when mounted ('webServer'); the routes serve the web GUI only. */
   webServer?: HostWebServer
-  /** The host settings provider, required via `inject` ('settings'). */
-  settings: HostSettings
+  /** The host settings service, when mounted ('settings'); see {@link HostSettings}. */
+  settings?: HostSettings
   /** The host default-model service, when mounted ('agentDefaultModel'). */
   get(service: 'agentDefaultModel'): HostAgentDefaultModel | undefined
   /** The host LLM registry, when mounted ('llm'). */
